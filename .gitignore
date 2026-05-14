@@ -1,0 +1,33 @@
+# Файлы окружения и секреты
+.env
+*.env
+!.env.example
+
+# Базы данных SQLite
+*.db
+*.sqlite
+*.sqlite3
+bot_database.db
+database.db
+
+# Виртуальные окружения
+venv/
+env/
+.venv/
+
+# Кэш Python и скомпилированные файлы
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Логи
+*.log
+
+# Настройки IDE
+.vscode/
+.idea/
+*.swp
+
+# Системные файлы
+Thumbs.db
+.DS_Store
