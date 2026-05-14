@@ -3,16 +3,15 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, C
 from aiogram.filters import CommandStart, CommandObject, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, delete
 from sqlalchemy.dialects.sqlite import insert
+from sqlalchemy.orm import selectinload
 
-from database.models import User, Group, group_admins, GlobalSettings, UserNote, SoftTrigger
+from database.models import User, Group, group_admins, GlobalSettings, UserNote, ChatMember, SoftTrigger
 from database.engine import AsyncSessionLocal
 from config.config import config
-
-from services.llm_client import LLMClient
-from services.notes_extractor import NotesExtractor
 
 router = Router()
 router.message.filter(F.chat.type == "private")
@@ -22,9 +21,14 @@ class GroupSettingsFSM(StatesGroup):
     waiting_for_memory = State()
     waiting_for_triggers = State()
     waiting_for_random_chance = State()
+    waiting_for_chat_notes = State()
+    waiting_for_idle_timeout = State()
+    waiting_for_max_ignores = State()
+    waiting_for_debounce = State()
+    waiting_for_max_wait = State()
+    waiting_for_paragraph_limit = State()
 
 class UserNotesFSM(StatesGroup):
-    waiting_for_ai_text = State()
     waiting_for_manual_text = State()
 
 async def is_user_group_admin(user_id: int, group_id: int) -> bool:
@@ -42,7 +46,7 @@ async def is_any_group_admin(user_id: int) -> bool:
 @router.callback_query(F.data == "cancel_fsm")
 async def cancel_fsm_action(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text("Действие отменено. Вы можете снова выбрать группу через /my_groups.")
+    await callback.message.edit_text("Действие отменено.")
     await callback.answer()
 
 @router.message(Command("cancel"))
@@ -56,6 +60,9 @@ async def cancel_fsm_text(message: Message, state: FSMContext):
 
 @router.message(CommandStart(deep_link=True), F.text.contains("manage_"))
 async def cmd_start_manage(message: Message, command: CommandObject, bot: Bot):
+    if message.from_user.id not in config.admin_ids:
+        await message.answer("У вас нет глобальных прав доступа к этому боту.")
+        return
     try:
         group_id = int(command.args.split("_")[1])
     except (IndexError, ValueError, AttributeError):
@@ -84,52 +91,26 @@ async def cmd_start_manage(message: Message, command: CommandObject, bot: Bot):
             group_id=group_id
         ).on_conflict_do_nothing(index_elements=['user_id', 'group_id'])
         await session.execute(link_stmt)
-
-        group_result = await session.execute(select(Group).where(Group.chat_id == group_id))
-        group = group_result.scalar_one_or_none()
-        
-        stmt_triggers = select(SoftTrigger.word).where(SoftTrigger.group_id == group_id)
-        result_triggers = await session.execute(stmt_triggers)
-        triggers_list = result_triggers.scalars().all()
-        
         await session.commit()
 
-    if not group:
-        await message.answer("Группа не найдена в базе данных.")
-        return
-
-    saved_triggers = ", ".join(triggers_list) if triggers_list else "не заданы"
-    chance_val = group.random_chance if group.random_chance is not None else 5
-
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Выбрать персону", callback_data=f"set_persona_{group_id}")],
-        [InlineKeyboardButton(text="Настроить память", callback_data=f"set_memory_{group_id}")],
-        [InlineKeyboardButton(text="Мягкие триггеры", callback_data=f"set_triggers_{group_id}")],
-        [InlineKeyboardButton(text="Случайные появления", callback_data=f"set_random_{group_id}")],
-        [InlineKeyboardButton(text="Закрыть", callback_data="close_menu")]
+        [InlineKeyboardButton(text="Открыть настройки", callback_data=f"open_group_{group_id}")]
     ])
-
-    await message.answer(
-        f"Управление группой: <b>{group.title}</b>\n\n"
-        f"Текущая персона: {group.active_persona}\n"
-        f"Глубина контекста: {group.context_length} сообщений\n"
-        f"Мягкие триггеры: {saved_triggers}\n"
-        f"Шанс случайного ответа: {chance_val}%\n\n"
-        f"Что хотите настроить?",
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
+    await message.answer("Вы подтверждены как администратор. Нажмите кнопку ниже для перехода в настройки.", reply_markup=keyboard)
 
 @router.message(Command("my_groups"))
 @router.message(F.text == "Мои группы")
 async def cmd_my_groups(message: Message):
+    if message.from_user.id not in config.admin_ids:
+        await message.answer("У вас нет глобальных прав доступа к этому боту.")
+        return
     async with AsyncSessionLocal() as session:
         stmt = select(Group).join(group_admins).where(group_admins.c.user_id == message.from_user.id)
         result = await session.execute(stmt)
         groups = result.scalars().all()
 
     if not groups:
-        await message.answer("Вы пока не управляете ни одной группой. Добавьте меня в чат и напишите там /manage.")
+        await message.answer("Вы пока не управляете ни одной группой.")
         return
 
     keyboard_builder = []
@@ -141,322 +122,162 @@ async def cmd_my_groups(message: Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_builder)
     await message.answer("Выберите группу для настройки:", reply_markup=keyboard)
 
+@router.callback_query(F.data == "back_to_groups")
+async def back_to_groups(callback: CallbackQuery):
+    async with AsyncSessionLocal() as session:
+        stmt = select(Group).join(group_admins).where(group_admins.c.user_id == callback.from_user.id)
+        result = await session.execute(stmt)
+        groups = result.scalars().all()
+
+    keyboard_builder = []
+    for group in groups:
+        keyboard_builder.append(
+            [InlineKeyboardButton(text=group.title, callback_data=f"open_group_{group.chat_id}")]
+        )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_builder)
+    await callback.message.edit_text("Выберите группу для настройки:", reply_markup=keyboard)
+
 @router.callback_query(F.data.startswith("open_group_"))
 async def open_group_settings(callback: CallbackQuery):
     group_id = int(callback.data.split("_")[2])
     
-    if not await is_user_group_admin(callback.from_user.id, group_id):
-        await callback.answer("У вас нет доступа к этой группе.", show_alert=True)
-        return
-    
     async with AsyncSessionLocal() as session:
-        result = await session.execute(select(Group).where(Group.chat_id == group_id))
-        group = result.scalar_one_or_none()
-        
-        stmt_triggers = select(SoftTrigger.word).where(SoftTrigger.group_id == group_id)
-        result_triggers = await session.execute(stmt_triggers)
-        triggers_list = result_triggers.scalars().all()
-
-    if not group:
-        await callback.answer("Ошибка: группа не найдена.", show_alert=True)
-        return
-
-    saved_triggers = ", ".join(triggers_list) if triggers_list else "не заданы"
-    chance_val = group.random_chance if group.random_chance is not None else 5
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Выбрать персону", callback_data=f"set_persona_{group_id}")],
-        [InlineKeyboardButton(text="Настроить память", callback_data=f"set_memory_{group_id}")],
-        [InlineKeyboardButton(text="Мягкие триггеры", callback_data=f"set_triggers_{group_id}")],
-        [InlineKeyboardButton(text="Случайные появления", callback_data=f"set_random_{group_id}")],
-        [InlineKeyboardButton(text="Закрыть", callback_data="close_menu")]
-    ])
-
-    await callback.message.edit_text(
-        f"Управление группой: <b>{group.title}</b>\n\n"
-        f"Текущая персона: {group.active_persona}\n"
-        f"Глубина контекста: {group.context_length} сообщений\n"
-        f"Мягкие триггеры: {saved_triggers}\n"
-        f"Шанс случайного ответа: {chance_val}%\n\n"
-        f"Что хотите настроить?",
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-@router.callback_query(F.data == "close_menu")
-async def close_menu(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.delete()
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("set_persona_"))
-async def ask_for_persona(callback: CallbackQuery, state: FSMContext):
-    group_id = int(callback.data.split("_")[2])
-    
-    if not await is_user_group_admin(callback.from_user.id, group_id):
-        await callback.answer("У вас нет доступа к этой группе.", show_alert=True)
-        return
-        
-    await state.update_data(group_id=group_id)
-    await state.set_state(GroupSettingsFSM.waiting_for_persona)
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="cancel_fsm")]])
-    await callback.message.answer(
-        "Отправь мне системный промпт (описание персоны) для этого чата.\n"
-        "Например: 'Ты саркастичный кот, отвечай коротко и с юмором.'",
-        reply_markup=keyboard
-    )
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("set_memory_"))
-async def ask_for_memory(callback: CallbackQuery, state: FSMContext):
-    group_id = int(callback.data.split("_")[2])
-    
-    if not await is_user_group_admin(callback.from_user.id, group_id):
-        await callback.answer("У вас нет доступа к этой группе.", show_alert=True)
-        return
-        
-    await state.update_data(group_id=group_id)
-    await state.set_state(GroupSettingsFSM.waiting_for_memory)
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="cancel_fsm")]])
-    await callback.message.answer(
-        "Отправь мне число от 1 до 50 — сколько последних сообщений бот должен помнить в этой группе:",
-        reply_markup=keyboard
-    )
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("set_triggers_"))
-async def ask_for_triggers(callback: CallbackQuery, state: FSMContext):
-    group_id = int(callback.data.split("_")[2])
-    
-    if not await is_user_group_admin(callback.from_user.id, group_id):
-        await callback.answer("У вас нет доступа к этой группе.", show_alert=True)
-        return
-        
-    await state.update_data(group_id=group_id)
-    await state.set_state(GroupSettingsFSM.waiting_for_triggers)
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="cancel_fsm")]])
-    await callback.message.answer(
-        "Отправь 2-3 имени или обращения через запятую, на которые я должен отзываться в чате.\n"
-        "Например: сансет, мишка, эй бот\n\nДля отключения мягких триггеров отправь цифру 0.",
-        reply_markup=keyboard
-    )
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("set_random_"))
-async def ask_for_random(callback: CallbackQuery, state: FSMContext):
-    group_id = int(callback.data.split("_")[2])
-    
-    if not await is_user_group_admin(callback.from_user.id, group_id):
-        await callback.answer("У вас нет доступа к этой группе.", show_alert=True)
-        return
-        
-    await state.update_data(group_id=group_id)
-    await state.set_state(GroupSettingsFSM.waiting_for_random_chance)
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="cancel_fsm")]])
-    
-    if config.tools_enabled:
-        text = (
-            "Отправь мне процент случайных появлений (от 0 до 100).\n\n"
-            "Так как включены инструменты (Tools), работает УМНЫЙ режим: "
-            "шанс проверяется только при длинных сообщений или активном обсуждении, "
-            "и ИИ сам решает, есть ли смысл вступать в диалог или лучше промолчать."
-        )
-    else:
-        text = (
-            "Отправь мне процент случайных появлений (от 0 до 100).\n\n"
-            "Инструменты ВЫКЛЮЧЕНЫ. Бот будет с этим шансом отвечать "
-            "на ЛЮБОЕ сообщение в чате (чистый рандом без ИИ-вето)."
-        )
-        
-    await callback.message.answer(text, reply_markup=keyboard)
-    await callback.answer()
-
-@router.message(GroupSettingsFSM.waiting_for_persona)
-async def save_persona(message: Message, state: FSMContext):
-    data = await state.get_data()
-    group_id = data.get("group_id")
-    
-    if not await is_user_group_admin(message.from_user.id, group_id):
-        await state.clear()
-        return
-        
-    async with AsyncSessionLocal() as session:
-        stmt = update(Group).where(Group.chat_id == group_id).values(active_persona=message.text)
-        await session.execute(stmt)
-        await session.commit()
-    await state.clear()
-    await message.answer("Персона успешно обновлена!")
-
-@router.message(GroupSettingsFSM.waiting_for_memory)
-async def save_memory(message: Message, state: FSMContext):
-    if not message.text.isdigit() or not (1 <= int(message.text) <= 50):
-        await message.answer("Пожалуйста, отправь число от 1 до 50.")
-        return
-    data = await state.get_data()
-    group_id = data.get("group_id")
-    
-    if not await is_user_group_admin(message.from_user.id, group_id):
-        await state.clear()
-        return
-        
-    memory_limit = int(message.text)
-    async with AsyncSessionLocal() as session:
-        stmt = update(Group).where(Group.chat_id == group_id).values(context_length=memory_limit)
-        await session.execute(stmt)
-        await session.commit()
-    await state.clear()
-    await message.answer(f"Глубина памяти успешно установлена: {memory_limit} сообщений.")
-
-@router.message(GroupSettingsFSM.waiting_for_triggers)
-async def save_triggers(message: Message, state: FSMContext):
-    data = await state.get_data()
-    group_id = data.get("group_id")
-    
-    if not await is_user_group_admin(message.from_user.id, group_id):
-        await state.clear()
-        return
-        
-    raw_text = message.text.strip()
-    
-    async with AsyncSessionLocal() as session:
-        await session.execute(delete(SoftTrigger).where(SoftTrigger.group_id == group_id))
-        
-        if raw_text == "0":
-            triggers_to_save = None
-        else:
-            triggers = [t.strip().lower() for t in raw_text.split(",") if t.strip()]
-            for word in triggers:
-                session.add(SoftTrigger(group_id=group_id, word=word))
-            triggers_to_save = ", ".join(triggers)
-            
-        await session.commit()
-        
-    await state.clear()
-    if triggers_to_save:
-        await message.answer(f"Мягкие триггеры успешно сохранены: {triggers_to_save}")
-    else:
-        await message.answer("Мягкие триггеры отключены.")
-
-@router.message(GroupSettingsFSM.waiting_for_random_chance)
-async def save_random(message: Message, state: FSMContext):
-    if not message.text.isdigit() or not (0 <= int(message.text) <= 100):
-        await message.answer("Пожалуйста, отправь целое число от 0 до 100.")
-        return
-    data = await state.get_data()
-    group_id = data.get("group_id")
-    
-    if not await is_user_group_admin(message.from_user.id, group_id):
-        await state.clear()
-        return
-        
-    chance = int(message.text)
-    
-    async with AsyncSessionLocal() as session:
-        stmt = update(Group).where(Group.chat_id == group_id).values(random_chance=chance)
-        await session.execute(stmt)
-        await session.commit()
-    await state.clear()
-    await message.answer(f"Шанс случайного появления установлен на {chance}%.")
-
-@router.message(Command("toggle_pm"))
-async def cmd_toggle_pm(message: Message):
-    if message.from_user.id != config.admin_id:
-        await message.answer("У вас нет прав для изменения глобальных настроек.")
-        return
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(GlobalSettings).where(GlobalSettings.id == 1))
-        settings = result.scalar_one_or_none()
-        if not settings:
-            settings = GlobalSettings(id=1, allow_all_pms=True)
-            session.add(settings)
-            status_text = "ВКЛЮЧЕНО"
-        else:
-            settings.allow_all_pms = not settings.allow_all_pms
-            status_text = "ВКЛЮЧЕНО" if settings.allow_all_pms else "ВЫКЛЮЧЕНО"
-        await session.commit()
-    await message.answer(f"Глобальное разрешение на общение в ЛС: {status_text}")
-
-@router.message(CommandStart(deep_link=True), F.text.contains("note_"))
-async def cmd_start_note(message: Message, command: CommandObject, bot: Bot):
-    try:
-        target_user_id = int(command.args.split("_")[1])
-    except (IndexError, ValueError, AttributeError):
-        return
-    async with AsyncSessionLocal() as session:
-        stmt = select(Group).join(group_admins).where(group_admins.c.user_id == message.from_user.id)
-        result = await session.execute(stmt)
-        if not result.scalars().first():
-            await message.answer("У вас нет прав администратора ни в одной группе.")
+        group = await session.scalar(select(Group).where(Group.chat_id == group_id))
+        if not group:
+            await callback.answer("Группа не найдена.", show_alert=True)
             return
-        notes_text = await NotesExtractor.get_user_notes_text(session, target_user_id)
-        
-    display_text = notes_text if notes_text else "Пока нет никаких записей."
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Дополнить через ИИ", callback_data=f"ai_note_{target_user_id}")],
-        [InlineKeyboardButton(text="Переписать вручную", callback_data=f"man_note_{target_user_id}")],
-        [InlineKeyboardButton(text="Закрыть", callback_data="close_menu")]
-    ])
-    await message.answer(
-        f"Досье на пользователя (ID: {target_user_id}):\n\n<b>{display_text}</b>\n\nВыберите действие:",
-        reply_markup=keyboard, parse_mode="HTML"
-    )
 
-@router.callback_query(F.data.startswith("ai_note_"))
-async def btn_ai_note(callback: CallbackQuery, state: FSMContext):
-    target_id = int(callback.data.split("_")[2])
+    text = f"Управление группой: {group.title}\nВыберите категорию настроек:"
     
-    if not await is_any_group_admin(callback.from_user.id):
-        await callback.answer("У вас нет прав доступа к досье.", show_alert=True)
-        return
-        
-    await state.update_data(target_id=target_id)
-    await state.set_state(UserNotesFSM.waiting_for_ai_text)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="cancel_fsm")]])
-    await callback.message.answer(
-        "Отправь мне любую информацию об этом пользователе сырым текстом.\n"
-        "Я прогоню это через нейросеть и аккуратно добавлю в базу.",
-        reply_markup=kb
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Личность и Контекст", callback_data=f"menu_persona_{group_id}")
+    builder.button(text="Триггеры и Появления", callback_data=f"menu_triggers_{group_id}")
+    builder.button(text="Динамика и Лимиты", callback_data=f"menu_limits_{group_id}")
+    builder.button(text="Досье участников", callback_data=f"users_list_{group_id}")
+    builder.button(text="Назад к списку", callback_data="back_to_groups")
+    builder.adjust(1)
+
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+
+@router.callback_query(F.data.startswith("menu_persona_"))
+async def menu_persona(callback: CallbackQuery):
+    group_id = int(callback.data.split("_")[2])
+    
+    async with AsyncSessionLocal() as session:
+        group = await session.scalar(select(Group).where(Group.chat_id == group_id))
+
+    persona_text = group.active_persona[:200] + "..." if group.active_persona and len(group.active_persona) > 200 else (group.active_persona or "Не задана")
+    chat_notes = group.chat_notes[:200] + "..." if group.chat_notes and len(group.chat_notes) > 200 else (group.chat_notes or "Не заданы")
+
+    text = (
+        f"Настройки личности и контекста\n\n"
+        f"Персона:\n{persona_text}\n\n"
+        f"Заметки чата:\n{chat_notes}\n\n"
+        f"Глубина контекста: {group.context_length} сообщений"
     )
-    await callback.answer()
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Изменить персону", callback_data=f"set_persona_{group_id}")
+    builder.button(text="Заметки чата", callback_data=f"set_chatnotes_{group_id}")
+    builder.button(text="Глубина контекста", callback_data=f"set_memory_{group_id}")
+    builder.button(text="Назад", callback_data=f"open_group_{group_id}")
+    builder.adjust(1)
+    
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+
+@router.callback_query(F.data.startswith("menu_triggers_"))
+async def menu_triggers(callback: CallbackQuery):
+    group_id = int(callback.data.split("_")[2])
+    
+    async with AsyncSessionLocal() as session:
+        group = await session.scalar(select(Group).options(selectinload(Group.triggers)).where(Group.chat_id == group_id))
+
+    triggers_list = [t.word for t in group.triggers] if group and group.triggers else []
+    saved_triggers = ", ".join(triggers_list) if triggers_list else "Не заданы"
+    if len(saved_triggers) > 100:
+        saved_triggers = saved_triggers[:100] + "..."
+
+    text = (
+        f"Настройки триггеров\n\n"
+        f"Мягкие триггеры: {saved_triggers}\n"
+        f"Шанс случайного ответа: {group.random_chance}%"
+    )
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Мягкие триггеры", callback_data=f"set_triggers_{group_id}")
+    builder.button(text="Случайные появления", callback_data=f"set_random_{group_id}")
+    builder.button(text="Назад", callback_data=f"open_group_{group_id}")
+    builder.adjust(1)
+    
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+
+@router.callback_query(F.data.startswith("menu_limits_"))
+async def menu_limits(callback: CallbackQuery):
+    group_id = int(callback.data.split("_")[2])
+    
+    async with AsyncSessionLocal() as session:
+        group = await session.scalar(select(Group).where(Group.chat_id == group_id))
+
+    text = (
+        f"Динамика и Лимиты\n\n"
+        f"Таймаут тишины (сон): {group.idle_timeout_minutes} мин\n"
+        f"Лимит игноров: {group.max_consecutive_ignores} раз\n"
+        f"Задержка debounce: {group.debounce_seconds} сек\n"
+        f"Жесткое ожидание: {group.max_wait_seconds} сек\n"
+        f"Макс. предложений: {group.paragraph_max_sentences}"
+    )
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Таймаут тишины", callback_data=f"set_idle_{group_id}")
+    builder.button(text="Лимит игноров", callback_data=f"set_ignores_{group_id}")
+    builder.button(text="Задержка debounce", callback_data=f"set_debounce_{group_id}")
+    builder.button(text="Жесткое ожидание", callback_data=f"set_maxwait_{group_id}")
+    builder.button(text="Лимит предложений", callback_data=f"set_paragraph_{group_id}")
+    builder.button(text="Назад", callback_data=f"open_group_{group_id}")
+    builder.adjust(2)
+    
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+
+@router.callback_query(F.data.startswith("users_list_"))
+async def show_chat_members(callback: CallbackQuery):
+    group_id = int(callback.data.split("_")[2])
+    
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(ChatMember).where(ChatMember.group_id == group_id).limit(50))
+        members = result.scalars().all()
+    
+    if not members:
+        await callback.answer("База участников пока пуста.", show_alert=True)
+        return
+
+    builder = InlineKeyboardBuilder()
+    for member in members:
+        builder.button(text=member.user_name, callback_data=f"man_note_{member.user_id}")
+    builder.button(text="Назад", callback_data=f"open_group_{group_id}")
+    builder.adjust(2)
+    await callback.message.edit_text("Выберите участника для настройки досье:", reply_markup=builder.as_markup())
 
 @router.callback_query(F.data.startswith("man_note_"))
 async def btn_man_note(callback: CallbackQuery, state: FSMContext):
     target_id = int(callback.data.split("_")[2])
     
     if not await is_any_group_admin(callback.from_user.id):
-        await callback.answer("У вас нет прав доступа к досье.", show_alert=True)
+        await callback.answer("У вас нет прав.", show_alert=True)
         return
         
     await state.update_data(target_id=target_id)
     await state.set_state(UserNotesFSM.waiting_for_manual_text)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="cancel_fsm")]])
-    await callback.message.answer(
-        "Внимание: Это полностью УДАЛИТ старые факты.\n"
-        "Отправь новые данные строго в формате 'Категория: Значение', каждое с новой строки.",
-        reply_markup=kb
-    )
-    await callback.answer()
-
-@router.message(UserNotesFSM.waiting_for_ai_text)
-async def process_ai_note(message: Message, state: FSMContext):
-    data = await state.get_data()
-    target_id = data.get("target_id")
-    
-    if not await is_any_group_admin(message.from_user.id):
-        await state.clear()
-        return
-        
-    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
     async with AsyncSessionLocal() as session:
-        success = await extractor.extract_from_admin(session, target_id, message.text)
-        
-    await state.clear()
-    if success:
-        await message.answer("Информация успешно обработана ИИ и добавлена в досье!")
-    else:
-        await message.answer("Не удалось извлечь факты.")
+        result = await session.execute(select(UserNote).where(UserNote.user_id == target_id))
+        user_note = result.scalar_one_or_none()
+    
+    current_text = user_note.note_text if user_note else "Пусто"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="cancel_fsm")]])
+    await callback.message.edit_text(
+        f"Текущее досье:\n{current_text}\n\nОтправьте новый текст досье. Это перезапишет старые данные. Отправьте 0 для удаления.",
+        reply_markup=kb
+    )
 
 @router.message(UserNotesFSM.waiting_for_manual_text)
 async def process_manual_note(message: Message, state: FSMContext):
@@ -467,16 +288,199 @@ async def process_manual_note(message: Message, state: FSMContext):
         await state.clear()
         return
         
-    lines = message.text.split('\n')
-    
     async with AsyncSessionLocal() as session:
-        await session.execute(delete(UserNote).where(UserNote.user_id == target_id))
-        for line in lines:
-            if ":" in line:
-                category, value = line.split(":", 1)
-                new_note = UserNote(user_id=target_id, category=category.strip().lower(), value=value.strip())
-                session.add(new_note)
+        if message.text.strip() == "0":
+            await session.execute(delete(UserNote).where(UserNote.user_id == target_id))
+        else:
+            result = await session.execute(select(UserNote).where(UserNote.user_id == target_id))
+            note = result.scalar_one_or_none()
+            if note:
+                note.note_text = message.text
+            else:
+                session.add(UserNote(user_id=target_id, note_text=message.text))
         await session.commit()
         
     await state.clear()
-    await message.answer("Досье полностью перезаписано вручную.")
+    await message.answer("Досье успешно обновлено.")
+
+@router.callback_query(F.data.startswith("set_"))
+async def route_set_callbacks(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    action = parts[1]
+    group_id = int(parts[2])
+
+    if not await is_user_group_admin(callback.from_user.id, group_id):
+        await callback.answer("У вас нет доступа к этой группе.", show_alert=True)
+        return
+
+    await state.update_data(group_id=group_id)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="cancel_fsm")]])
+
+    if action == "persona":
+        await state.set_state(GroupSettingsFSM.waiting_for_persona)
+        await callback.message.edit_text("Отправьте системный промпт (описание персоны):", reply_markup=keyboard)
+    elif action == "chatnotes":
+        await state.set_state(GroupSettingsFSM.waiting_for_chat_notes)
+        await callback.message.edit_text("Отправьте правила и заметки чата (или 0 для удаления):", reply_markup=keyboard)
+    elif action == "memory":
+        await state.set_state(GroupSettingsFSM.waiting_for_memory)
+        await callback.message.edit_text("Отправьте глубину памяти (число сообщений):", reply_markup=keyboard)
+    elif action == "triggers":
+        await state.set_state(GroupSettingsFSM.waiting_for_triggers)
+        await callback.message.edit_text("Отправьте имена-триггеры через запятую (или 0 для удаления):", reply_markup=keyboard)
+    elif action == "random":
+        await state.set_state(GroupSettingsFSM.waiting_for_random_chance)
+        await callback.message.edit_text("Отправьте шанс случайного появления (0-100):", reply_markup=keyboard)
+    elif action == "idle":
+        await state.set_state(GroupSettingsFSM.waiting_for_idle_timeout)
+        await callback.message.edit_text("Отправьте таймаут тишины в минутах:", reply_markup=keyboard)
+    elif action == "ignores":
+        await state.set_state(GroupSettingsFSM.waiting_for_max_ignores)
+        await callback.message.edit_text("Отправьте лимит тегов IGNORE подряд:", reply_markup=keyboard)
+    elif action == "debounce":
+        await state.set_state(GroupSettingsFSM.waiting_for_debounce)
+        await callback.message.edit_text("Отправьте задержку сбора (debounce) в секундах:", reply_markup=keyboard)
+    elif action == "maxwait":
+        await state.set_state(GroupSettingsFSM.waiting_for_max_wait)
+        await callback.message.edit_text("Отправьте жесткий дедлайн ожидания в секундах:", reply_markup=keyboard)
+    elif action == "paragraph":
+        await state.set_state(GroupSettingsFSM.waiting_for_paragraph_limit)
+        await callback.message.edit_text("Отправьте ограничение предложений в абзаце:", reply_markup=keyboard)
+    
+    await callback.answer()
+
+@router.message(GroupSettingsFSM.waiting_for_persona)
+async def save_persona(message: Message, state: FSMContext):
+    data = await state.get_data()
+    async with AsyncSessionLocal() as session:
+        await session.execute(update(Group).where(Group.chat_id == data["group_id"]).values(active_persona=message.text))
+        await session.commit()
+    await state.clear()
+    await message.answer("Персона обновлена.")
+
+@router.message(GroupSettingsFSM.waiting_for_chat_notes)
+async def save_chat_notes(message: Message, state: FSMContext):
+    data = await state.get_data()
+    val = None if message.text.strip() == "0" else message.text
+    async with AsyncSessionLocal() as session:
+        await session.execute(update(Group).where(Group.chat_id == data["group_id"]).values(chat_notes=val))
+        await session.commit()
+    await state.clear()
+    await message.answer("Заметки чата обновлены.")
+
+@router.message(GroupSettingsFSM.waiting_for_memory)
+async def save_memory(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("Отправьте число.")
+        return
+    data = await state.get_data()
+    async with AsyncSessionLocal() as session:
+        await session.execute(update(Group).where(Group.chat_id == data["group_id"]).values(context_length=int(message.text)))
+        await session.commit()
+    await state.clear()
+    await message.answer("Глубина памяти сохранена.")
+
+@router.message(GroupSettingsFSM.waiting_for_random_chance)
+async def save_random(message: Message, state: FSMContext):
+    if not message.text.isdigit() or not (0 <= int(message.text) <= 100):
+        await message.answer("Отправьте число от 0 до 100.")
+        return
+    data = await state.get_data()
+    async with AsyncSessionLocal() as session:
+        await session.execute(update(Group).where(Group.chat_id == data["group_id"]).values(random_chance=int(message.text)))
+        await session.commit()
+    await state.clear()
+    await message.answer("Шанс сохранен.")
+
+@router.message(GroupSettingsFSM.waiting_for_idle_timeout)
+async def save_idle(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("Отправьте число.")
+        return
+    data = await state.get_data()
+    async with AsyncSessionLocal() as session:
+        await session.execute(update(Group).where(Group.chat_id == data["group_id"]).values(idle_timeout_minutes=int(message.text)))
+        await session.commit()
+    await state.clear()
+    await message.answer("Таймаут тишины сохранен.")
+
+@router.message(GroupSettingsFSM.waiting_for_max_ignores)
+async def save_ignores(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("Отправьте число.")
+        return
+    data = await state.get_data()
+    async with AsyncSessionLocal() as session:
+        await session.execute(update(Group).where(Group.chat_id == data["group_id"]).values(max_consecutive_ignores=int(message.text)))
+        await session.commit()
+    await state.clear()
+    await message.answer("Лимит игноров сохранен.")
+
+@router.message(GroupSettingsFSM.waiting_for_debounce)
+async def save_debounce(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("Отправьте число.")
+        return
+    data = await state.get_data()
+    async with AsyncSessionLocal() as session:
+        await session.execute(update(Group).where(Group.chat_id == data["group_id"]).values(debounce_seconds=int(message.text)))
+        await session.commit()
+    await state.clear()
+    await message.answer("Задержка сохранена.")
+
+@router.message(GroupSettingsFSM.waiting_for_max_wait)
+async def save_maxwait(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("Отправьте число.")
+        return
+    data = await state.get_data()
+    async with AsyncSessionLocal() as session:
+        await session.execute(update(Group).where(Group.chat_id == data["group_id"]).values(max_wait_seconds=int(message.text)))
+        await session.commit()
+    await state.clear()
+    await message.answer("Жесткое ожидание сохранено.")
+
+@router.message(GroupSettingsFSM.waiting_for_paragraph_limit)
+async def save_paragraph(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("Отправьте число.")
+        return
+    data = await state.get_data()
+    async with AsyncSessionLocal() as session:
+        await session.execute(update(Group).where(Group.chat_id == data["group_id"]).values(paragraph_max_sentences=int(message.text)))
+        await session.commit()
+    await state.clear()
+    await message.answer("Лимит предложений сохранен.")
+
+@router.message(GroupSettingsFSM.waiting_for_triggers)
+async def save_triggers(message: Message, state: FSMContext):
+    data = await state.get_data()
+    group_id = data["group_id"]
+    raw_text = message.text.strip()
+    
+    async with AsyncSessionLocal() as session:
+        await session.execute(delete(SoftTrigger).where(SoftTrigger.group_id == group_id))
+        if raw_text != "0":
+            triggers = [t.strip().lower() for t in raw_text.split(",") if t.strip()]
+            for word in triggers:
+                session.add(SoftTrigger(group_id=group_id, word=word))
+        await session.commit()
+        
+    await state.clear()
+    await message.answer("Мягкие триггеры сохранены.")
+
+@router.message(Command("toggle_pm"))
+async def cmd_toggle_pm(message: Message):
+    if message.from_user.id != config.admin_ids:
+        return
+    async with AsyncSessionLocal() as session:
+        settings = await session.scalar(select(GlobalSettings).where(GlobalSettings.id == 1))
+        if not settings:
+            settings = GlobalSettings(id=1, allow_all_pms=True)
+            session.add(settings)
+            status = "ВКЛЮЧЕНО"
+        else:
+            settings.allow_all_pms = not settings.allow_all_pms
+            status = "ВКЛЮЧЕНО" if settings.allow_all_pms else "ВЫКЛЮЧЕНО"
+        await session.commit()
+    await message.answer(f"Глобальное разрешение на ЛС: {status}")

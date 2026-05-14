@@ -45,24 +45,3 @@ async def cmd_manage(message: Message):
     ])
     
     await message.reply("Настройки чата доступны в личных сообщениях:", reply_markup=keyboard)
-
-@router.message(Command("note"), F.chat.type.in_(["group", "supergroup"]))
-async def cmd_user_note(message: Message):
-    if not message.reply_to_message:
-        await message.reply("Эту команду нужно отправлять в ответ на сообщение пользователя.")
-        return
-
-    chat_member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
-    if chat_member.status not in ["administrator", "creator"]:
-        await message.reply("Только администраторы могут управлять заметками.")
-        return
-
-    target_user = message.reply_to_message.from_user
-    bot_info = await message.bot.get_me()
-    deep_link = f"https://t.me/{bot_info.username}?start=note_{target_user.id}"
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Заметки: {target_user.first_name}", url=deep_link)]
-    ])
-    
-    await message.reply("Управление памятью об этом пользователе доступно в ЛС:", reply_markup=keyboard)

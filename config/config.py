@@ -5,7 +5,8 @@ class Config:
     def __init__(self):
         load_dotenv(override=True)
         self.bot_token: str = os.getenv("BOT_TOKEN", "")
-        self.admin_id: int = int(os.getenv("ADMIN_ID", 0))
+        admin_id_raw = os.getenv("ADMIN_ID", "")
+        self.admin_ids = [int(x.strip()) for x in admin_id_raw.split(",") if x.strip().isdigit()]
         
         self.use_openrouter: bool = os.getenv("USE_OPENROUTER", "False").lower() == "true"
         

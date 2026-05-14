@@ -13,7 +13,7 @@ def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="Мои группы")]
     ]
 
-    if user_id == config.admin_id:
+    if user_id == config.admin_ids:
         kb_list.append([KeyboardButton(text="Глобальные настройки")])
         
     kb_list.append([KeyboardButton(text="Помощь")])

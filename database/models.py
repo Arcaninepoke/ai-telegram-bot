@@ -31,8 +31,15 @@ class Group(Base):
     active_persona = Column(String, default="Ты умный ИИ-ассистент.")
     context_length = Column(Integer, default=10)
     random_chance = Column(Integer, default=5)
+    chat_notes = Column(String, nullable=True)
+    idle_timeout_minutes = Column(Integer, default=5)
+    max_consecutive_ignores = Column(Integer, default=3)
+    debounce_seconds = Column(Integer, default=4)
+    max_wait_seconds = Column(Integer, default=15)
+    paragraph_max_sentences = Column(Integer, default=3)
     admins = relationship("User", secondary=group_admins, back_populates="admin_in")
     triggers = relationship("SoftTrigger", back_populates="group", cascade="all, delete-orphan")
+    members = relationship("ChatMember", back_populates="group", cascade="all, delete-orphan")
 
 class GlobalSettings(Base):
     __tablename__ = 'global_settings'
@@ -42,10 +49,8 @@ class GlobalSettings(Base):
 class UserNote(Base):
     __tablename__ = 'user_notes'
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, nullable=False)
-    category = Column(String, nullable=False)
-    value = Column(String, nullable=False)
-    __table_args__ = (UniqueConstraint('user_id', 'category', name='_user_category_uc'),)
+    user_id = Column(Integer, unique=True, nullable=False)
+    note_text = Column(String, nullable=False)
 
 class MessageHistory(Base):
     __tablename__ = 'message_history'
@@ -53,3 +58,12 @@ class MessageHistory(Base):
     chat_id = Column(Integer, nullable=False)
     role = Column(String, nullable=False)
     content = Column(String, nullable=False)
+
+class ChatMember(Base):
+    __tablename__ = 'chat_members'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    group_id = Column(Integer, ForeignKey('groups.chat_id', ondelete="CASCADE"))
+    user_id = Column(Integer, nullable=False)
+    user_name = Column(String, nullable=False)
+    group = relationship("Group", back_populates="members")
+    __table_args__ = (UniqueConstraint('group_id', 'user_id', name='_group_user_uc'),)
