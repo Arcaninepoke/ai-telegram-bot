@@ -20,6 +20,7 @@ class GroupSettingsFSM(StatesGroup):
     waiting_for_persona = State()
     waiting_for_memory = State()
     waiting_for_triggers = State()
+    waiting_for_persona_interests = State()
     waiting_for_random_chance = State()
     waiting_for_chat_notes = State()
     waiting_for_idle_timeout = State()
@@ -154,6 +155,8 @@ async def open_group_settings(callback: CallbackQuery):
     builder.button(text="Триггеры и Появления", callback_data=f"menu_triggers_{group_id}")
     builder.button(text="Динамика и Лимиты", callback_data=f"menu_limits_{group_id}")
     builder.button(text="Досье участников", callback_data=f"users_list_{group_id}")
+    mode_label = "Режим: ролевой" if group.mode == "roleplay" else "Режим: чат"
+    builder.button(text=mode_label, callback_data=f"toggle_mode_{group.chat_id}")
     builder.button(text="Назад к списку", callback_data="back_to_groups")
     builder.adjust(1)
 
@@ -168,16 +171,19 @@ async def menu_persona(callback: CallbackQuery):
 
     persona_text = group.active_persona[:200] + "..." if group.active_persona and len(group.active_persona) > 200 else (group.active_persona or "Не задана")
     chat_notes = group.chat_notes[:200] + "..." if group.chat_notes and len(group.chat_notes) > 200 else (group.chat_notes or "Не заданы")
+    interests_text = group.persona_interests[:100] + "..." if group.persona_interests and len(group.persona_interests) > 100 else (group.persona_interests or "Не заданы")
 
     text = (
         f"Настройки личности и контекста\n\n"
         f"Персона:\n{persona_text}\n\n"
+        f"Интересы (для случайных появлений):\n{interests_text}\n\n"
         f"Заметки чата:\n{chat_notes}\n\n"
         f"Глубина контекста: {group.context_length} сообщений"
     )
     
     builder = InlineKeyboardBuilder()
     builder.button(text="Изменить персону", callback_data=f"set_persona_{group_id}")
+    builder.button(text="Интересы персоны", callback_data=f"set_interests_{group_id}")
     builder.button(text="Заметки чата", callback_data=f"set_chatnotes_{group_id}")
     builder.button(text="Глубина контекста", callback_data=f"set_memory_{group_id}")
     builder.button(text="Назад", callback_data=f"open_group_{group_id}")
@@ -319,6 +325,9 @@ async def route_set_callbacks(callback: CallbackQuery, state: FSMContext):
     if action == "persona":
         await state.set_state(GroupSettingsFSM.waiting_for_persona)
         await callback.message.edit_text("Отправьте системный промпт (описание персоны):", reply_markup=keyboard)
+    elif action == "interests":
+        await state.set_state(GroupSettingsFSM.waiting_for_persona_interests)
+        await callback.message.edit_text("Отправьте темы/интересы через запятую (или 0 для удаления):", reply_markup=keyboard)
     elif action == "chatnotes":
         await state.set_state(GroupSettingsFSM.waiting_for_chat_notes)
         await callback.message.edit_text("Отправьте правила и заметки чата (или 0 для удаления):", reply_markup=keyboard)
@@ -484,3 +493,46 @@ async def cmd_toggle_pm(message: Message):
             status = "ВКЛЮЧЕНО" if settings.allow_all_pms else "ВЫКЛЮЧЕНО"
         await session.commit()
     await message.answer(f"Глобальное разрешение на ЛС: {status}")
+
+@router.message(GroupSettingsFSM.waiting_for_persona_interests)
+async def save_persona_interests(message: Message, state: FSMContext):
+    data = await state.get_data()
+    val = None if message.text.strip() == "0" else message.text
+    async with AsyncSessionLocal() as session:
+        await session.execute(update(Group).where(Group.chat_id == data["group_id"]).values(persona_interests=val))
+        await session.commit()
+    await state.clear()
+    await message.answer("Интересы персоны обновлены.")
+
+@router.callback_query(F.data.startswith("toggle_mode_"))
+async def toggle_mode(callback: CallbackQuery):
+    group_id = int(callback.data.split("_")[2])
+    
+    if not await is_user_group_admin(callback.from_user.id, group_id):
+        await callback.answer("Нет прав.", show_alert=True)
+        return
+
+    async with AsyncSessionLocal() as session:
+        group = await session.scalar(select(Group).where(Group.chat_id == group_id))
+        if not group:
+            await callback.answer("Группа не найдена.")
+            return
+        
+        group.mode = "roleplay" if group.mode == "chat" else "chat"
+        await session.commit()
+        current_mode = group.mode
+
+    new_label = "ролевой" if current_mode == "roleplay" else "чат"
+    await callback.answer(f"Режим переключен на: {new_label}")
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Личность и Контекст", callback_data=f"menu_persona_{group_id}")
+    builder.button(text="Триггеры и Появления", callback_data=f"menu_triggers_{group_id}")
+    builder.button(text="Динамика и Лимиты", callback_data=f"menu_limits_{group_id}")
+    builder.button(text="Досье участников", callback_data=f"users_list_{group_id}")
+    mode_label = "Режим: ролевой" if current_mode == "roleplay" else "Режим: чат"
+    builder.button(text=mode_label, callback_data=f"toggle_mode_{group_id}")
+    builder.button(text="Назад к списку", callback_data="back_to_groups")
+    builder.adjust(1)
+
+    await callback.message.edit_reply_markup(reply_markup=builder.as_markup())

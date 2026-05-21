@@ -2,7 +2,7 @@ import asyncio
 import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import BotCommand
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats
 import aiohttp
 
 from config.config import config
@@ -26,12 +26,14 @@ async def main():
     dp.include_router(settings.router)
     dp.include_router(base.router)
     dp.include_router(chat.router)
-
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Запустить бота"),
-        BotCommand(command="my_groups", description="Управление группами"),
-        BotCommand(command="help", description="Справка")
-    ])
+    await bot.set_my_commands(
+        commands=[
+            BotCommand(command="start", description="Запустить бота"),
+            BotCommand(command="my_groups", description="Управление группами"),
+            BotCommand(command="help", description="Справка")
+        ],
+        scope=BotCommandScopeAllPrivateChats()
+    )
 
     await bot.delete_webhook(drop_pending_updates=True)
     

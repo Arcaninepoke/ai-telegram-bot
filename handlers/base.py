@@ -7,13 +7,14 @@ from database.models import GlobalSettings
 from sqlalchemy import select
 
 router = Router()
+router.message.filter(F.chat.type == "private")
 
 def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     kb_list = [
         [KeyboardButton(text="Мои группы")]
     ]
 
-    if user_id == config.admin_ids:
+    if user_id in config.admin_ids:
         kb_list.append([KeyboardButton(text="Глобальные настройки")])
         
     kb_list.append([KeyboardButton(text="Помощь")])
@@ -36,19 +37,21 @@ async def cmd_start(message: Message):
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     help_text = (
-        "Справочник по работе с ботом:\n\n"
+        "Справочная информация:\n\n"
         "В личных сообщениях:\n"
         "/my_groups или кнопка 'Мои группы' - Настройка подключенных бесед.\n"
         "/cancel - Отмена любого текущего действия (ввода текста).\n\n"
         "В группах (только для администраторов):\n"
         "/manage - Получить ссылку на настройку текущей группы.\n"
-        "/note (в ответ на сообщение) - Открыть меню редактирования заметки о пользователе."
+        "/dismiss - Принудительно отключить активный режим ИИ.\n"
+        "/clean - Полностью очистить память диалога для этой группы.\n"
+        "/sleep N - Отправить бота в режим тишины на N минут."
     )
     await message.answer(help_text)
 
 @router.message(F.text == "Глобальные настройки")
 async def btn_global_settings(message: Message):
-    if message.from_user.id != config.admin_id:
+    if message.from_user.id not in config.admin_ids:
         return
 
     async with AsyncSessionLocal() as session:
@@ -62,12 +65,4 @@ async def btn_global_settings(message: Message):
         f"Панель главного администратора.\n\n"
         f"Свободное общение в ЛС для всех пользователей сейчас: {status}\n\n"
         f"Чтобы изменить статус, введите команду /toggle_pm"
-    )
-
-@router.message(Command("note"), F.chat.type == "private")
-async def cmd_note_in_pm(message: Message):
-    await message.answer(
-        "Команда /note работает только внутри групповых чатов.\n\n"
-        "Чтобы создать или посмотреть заметку о пользователе, перейдите в нужную беседу "
-        "и отправьте /note в ответ (Reply) на его сообщение."
     )

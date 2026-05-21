@@ -1,5 +1,5 @@
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Table, UniqueConstraint
-from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Table, UniqueConstraint, Text
+from sqlalchemy.orm import Mapped, mapped_column, declarative_base, relationship
 
 Base = declarative_base()
 
@@ -40,6 +40,8 @@ class Group(Base):
     admins = relationship("User", secondary=group_admins, back_populates="admin_in")
     triggers = relationship("SoftTrigger", back_populates="group", cascade="all, delete-orphan")
     members = relationship("ChatMember", back_populates="group", cascade="all, delete-orphan")
+    persona_interests: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mode: Mapped[str] = mapped_column(String(16), default="chat", server_default="chat")
 
 class GlobalSettings(Base):
     __tablename__ = 'global_settings'

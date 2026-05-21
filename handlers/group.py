@@ -1,5 +1,5 @@
 from aiogram import Router, F
-from aiogram.types import Message, ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from aiogram.filters import Command, ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.sqlite import insert
@@ -24,7 +24,8 @@ async def bot_added_to_group(event: ChatMemberUpdated):
         
     await event.bot.send_message(
         event.chat.id,
-        "Всем привет! Я ИИ-ассистент. Администраторы могут настроить меня с помощью команды /manage"
+        "Всем привет! Я ИИ-ассистент. Администраторы могут настроить меня с помощью команды /manage",
+        reply_markup=ReplyKeyboardRemove()
     )
 
 @router.message(Command("manage"))
