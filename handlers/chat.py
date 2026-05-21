@@ -875,4 +875,3 @@ async def handle_group_messages(message: Message):
             last_bot_response_times[chat_id] = time.time()
             await memory_manager.add_message(session, chat_id, "assistant", ai_response)
             await message.reply(ai_response)
-}
