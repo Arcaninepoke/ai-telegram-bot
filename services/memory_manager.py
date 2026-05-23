@@ -9,11 +9,18 @@ class MemoryManager:
         await session.commit()
 
     async def enforce_limit(self, session: AsyncSession, chat_id: int, limit: int):
-        stmt = select(MessageHistory.id).where(MessageHistory.chat_id == chat_id).order_by(MessageHistory.id.desc()).offset(limit)
+        stmt = (
+            select(MessageHistory.id)
+            .where(MessageHistory.chat_id == chat_id)
+            .order_by(MessageHistory.id.desc())
+            .offset(limit)
+        )
         result = await session.execute(stmt)
         old_ids = result.scalars().all()
         if old_ids:
-            await session.execute(delete(MessageHistory).where(MessageHistory.id.in_(old_ids)))
+            await session.execute(
+                delete(MessageHistory).where(MessageHistory.id.in_(old_ids))
+            )
             await session.commit()
 
     async def get_context(self, session: AsyncSession, chat_id: int, limit: int) -> list[dict]:

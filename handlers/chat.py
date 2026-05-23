@@ -26,7 +26,8 @@ memory_manager = MemoryManager()
 
 active_group_sessions = {}
 chat_locks = {}
-last_message_times = {}
+last_operation_ids = {}
+
 last_bot_response_times = {}
 first_trigger_times = {}
 sleep_timers = {}
@@ -114,8 +115,10 @@ async def perform_web_search(query: str, api_key: str) -> list:
         "api_key": api_key, "query": query, "search_depth": "basic",
         "include_answer": False, "max_results": 5
     }
+    
+    timeout = aiohttp.ClientTimeout(total=10.0)
     try:
-        async with http_session.post(url, json=payload) as response:
+        async with http_session.post(url, json=payload, timeout=timeout) as response:
             if response.status == 200:
                 data = await response.json()
                 results = data.get("results", [])
@@ -261,7 +264,7 @@ async def security_check_new_members(message: Message):
                 await message.bot.leave_chat(message.chat.id)
                 return
             else:
-                logging.info(f"[SECURITY] Бот добавлен доверенным лицом {message.from_user.id} в чат {message.chat.id}.")
+                logging.info(f"[SECURITY] Бот добавлен доверенным лицом {message.from_user.id} in чат {message.chat.id}.")
 
 
 @router.message(F.chat.type == "private", (F.text | F.photo) & ~F.text.startswith("/") & ~F.caption.startswith("/"))
@@ -487,32 +490,33 @@ async def handle_group_messages(message: Message):
             random_trigger_state.pop(chat_id, None)
             return
 
-    current_time = time.time()
-    last_message_times[chat_id] = current_time
-    if chat_id not in first_trigger_times:
-        first_trigger_times[chat_id] = current_time
+    current_op_id = last_operation_ids.get(chat_id, 0) + 1
+    last_operation_ids[chat_id] = current_op_id
 
     logging.debug(f"[DEBOUNCE {chat_id}] Ожидание {debounce_val} сек...")
     await message.bot.send_chat_action(chat_id=chat_id, action="typing")
+    
+    if chat_id not in first_trigger_times:
+        first_trigger_times[chat_id] = time.time()
+
     await asyncio.sleep(debounce_val)
 
-    time_since_first = time.time() - first_trigger_times.get(chat_id, current_time)
+    time_since_first = time.time() - first_trigger_times.get(chat_id, time.time())
 
-    if last_message_times[chat_id] != current_time:
+    if last_operation_ids.get(chat_id) != current_op_id:
         if time_since_first < max_wait_val:
-            logging.debug(f"[DEBOUNCE {chat_id}] Перебит другим сообщением. Отменяю задачу.")
+            logging.debug(f"[DEBOUNCE {chat_id}] Операция #{current_op_id} заменена более новой. Отмена.")
             return
         else:
-            logging.warning(f"[DEBOUNCE {chat_id}] Жёсткий лимит {max_wait_val}с. Форсирую ответ.")
+            logging.warning(f"[DEBOUNCE {chat_id}] Жёсткий лимит {max_wait_val}с превышен. Пробиваем ответ.")
 
     if chat_id not in chat_locks:
         chat_locks[chat_id] = asyncio.Lock()
 
     async with chat_locks[chat_id]:
-        logging.info(f"[LOCK {chat_id}] Замок получен. Формирую ответ.")
-
-        if chat_id not in first_trigger_times and last_message_times[chat_id] != current_time:
-            logging.debug(f"[LOCK {chat_id}] Задача устарела — другой процесс уже ответил.")
+        logging.info(f"[LOCK {chat_id}] Замок получен для операции #{current_op_id}. Формирую ответ.")
+        if chat_id not in first_trigger_times and last_operation_ids.get(chat_id) != current_op_id:
+            logging.debug(f"[LOCK {chat_id}] Задача устарела — параллельный поток уже обработал стек.")
             return
 
         if not is_direct_address:
@@ -614,7 +618,7 @@ async def handle_group_messages(message: Message):
                             "Вступай ТОЛЬКО если тебе действительно есть что добавить по существу. "
                             "Если разговор ушёл в сторону или люди общаются между собой — строго <IGNORE>."
                         )
-                        logging.debug(f"[PROMPT {chat_id}] Подсказка вмешательства: interest «{matched}».")
+                        logging.debug(f"[PROMPT {chat_id}] Подсказка вмешательства: интерес «{matched}».")
                     else:
                         prompt_parts.append(
                             "(Ты вошёл инициативно — применяй <IGNORE> при малейшем сомнении.)"
@@ -750,12 +754,17 @@ async def handle_group_messages(message: Message):
                 f"инструментов: {len(available_tools)}, режим: {mode}."
             )
             await message.bot.send_chat_action(chat_id=chat_id, action="typing")
+            
             ai_response_data = await llm.generate_response(
                 messages_to_send,
                 tools=available_tools if available_tools else None
             )
 
-            if ai_response_data.get("type") == "tool_calls":
+            loops_count = 0
+            MAX_TOOL_LOOPS = 3
+            
+            while ai_response_data.get("type") == "tool_calls" and loops_count < MAX_TOOL_LOOPS:
+                loops_count += 1
                 tool_calls = ai_response_data.get("tool_calls")
                 message_obj = ai_response_data.get("message_obj")
 
@@ -805,8 +814,9 @@ async def handle_group_messages(message: Message):
                     await message.reply(farewell_msg)
                     return
 
-                logging.info(f"[LLM REQ {chat_id}] Отправляю результаты инструментов обратно в LLM...")
-                ai_response_data = await llm.generate_response(messages_to_send)
+                logging.info(f"[LLM REQ {chat_id}] Итерация #{loops_count}. Возвращаем результаты инструментов в LLM...")
+                await message.bot.send_chat_action(chat_id=chat_id, action="typing")
+                ai_response_data = await llm.generate_response(messages_to_send, tools=available_tools if available_tools else None)
 
             ai_response = ai_response_data.get("content", "Не удалось сгенерировать ответ.")
 
